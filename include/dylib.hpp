@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <utility>
@@ -26,6 +27,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #undef WIN32_LEAN_AND_MEAN
+#include <Psapi.h>
 #else
 #include <windows.h>
 #endif
@@ -43,6 +45,95 @@
 #define DYLIB_WIN_MAC_OTHER(win_def, mac_def, other_def) other_def
 #define DYLIB_WIN_OTHER(win_def, other_def) other_def
 #endif
+
+#if (defined(_WIN32) || defined(_WIN64)) && defined(DYLIB_PRINT_MISSING)
+
+#include <vector>
+
+// Modifed from: https://stackoverflow.com/questions/15960437/how-to-read-import-directory-table-in-c
+
+/*Convert Virtual Address to File Offset */
+DWORD Rva2Offset(DWORD rva, PIMAGE_SECTION_HEADER psh, PIMAGE_NT_HEADERS pnt) {
+    size_t i = 0;
+    PIMAGE_SECTION_HEADER pSeh;
+    if (rva == 0) {
+        return (rva);
+    }
+    pSeh = psh;
+    for (i = 0; i < pnt->FileHeader.NumberOfSections; i++) {
+        if (rva >= pSeh->VirtualAddress && rva < pSeh->VirtualAddress + pSeh->Misc.VirtualSize) {
+            break;
+        }
+        pSeh++;
+    }
+    return (rva - pSeh->VirtualAddress + pSeh->PointerToRawData);
+}
+
+void PrintDllImport(const std::string &filePath, std::vector<std::string> &imports) {
+    if (filePath.empty())
+        return;
+
+    HANDLE handle = CreateFile(filePath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (handle == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD byteRead, size = GetFileSize(handle, nullptr);
+    PVOID virtualPointer = NULL;
+    virtualPointer = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+
+    // Get pointer to NT header
+    if (virtualPointer)
+    {
+        (void)ReadFile(handle, virtualPointer, size, &byteRead, nullptr);
+        CloseHandle(handle);
+
+        auto ntHeaders =
+                (PIMAGE_NT_HEADERS)(PCHAR(virtualPointer) + PIMAGE_DOS_HEADER(virtualPointer)->e_lfanew);
+
+        // Pointer to first section header
+        PIMAGE_SECTION_HEADER pSech = IMAGE_FIRST_SECTION(ntHeaders);
+
+        // Pointer to import descriptor
+        PIMAGE_IMPORT_DESCRIPTOR pImportDescriptor;
+        __try {
+                /*if size of the table is 0 - Import Table does not exist */
+                if (ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size != 0) {
+                    pImportDescriptor =
+                            (PIMAGE_IMPORT_DESCRIPTOR)((DWORD_PTR)virtualPointer +
+                                                       Rva2Offset(
+                                                               ntHeaders->OptionalHeader
+                                                                       .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                                                                       .VirtualAddress,
+                                                               pSech, ntHeaders));
+
+                    LPSTR libname[256];
+                    size_t i = 0;
+                    // Walk until you reached an empty IMAGE_IMPORT_DESCRIPTOR
+                    while (pImportDescriptor->Name != NULL) {
+                        // Get the name of each DLL
+                        libname[i] = (PCHAR)((DWORD_PTR)virtualPointer +
+                                             Rva2Offset(pImportDescriptor->Name, pSech, ntHeaders));
+                        if (!LoadLibrary(libname[i]))
+                            imports.emplace_back(libname[i]);
+                        pImportDescriptor++; // advance to next IMAGE_IMPORT_DESCRIPTOR
+                        i++;
+                    }
+                }
+                else {
+                }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (EXCEPTION_ACCESS_VIOLATION == GetExceptionCode()) {
+                printf("Exception: EXCEPTION_ACCESS_VIOLATION\n");
+            }
+        }
+
+        VirtualFree(virtualPointer, 0, MEM_RELEASE);
+    }
+}
+#endif // DYLIB_PRINT_MISSING
 
 /**
  *  The dylib class can hold a dynamic library instance and interact with it 
@@ -132,8 +223,21 @@ public:
 
         m_handle = open((final_path + final_name).c_str());
 
-        if (!m_handle)
-            throw load_error("Could not load library \"" + final_path + final_name + "\"\n" + get_error_description());
+        if (!m_handle) {
+            std::stringstream os;
+            os << get_error_description() << "\n";
+#if (defined(_WIN32) || defined(_WIN64)) && defined(DYLIB_PRINT_MISSING)
+            std::vector<std::string> libs;
+            auto path = final_path + final_name;
+            PrintDllImport(path, libs);
+            os << "  Loaded fail:  (file missing or its dependencies were not found) \n";
+            int i = 1;
+            for (const auto& dep : libs) {
+                os << "    " << i++ << ": " << dep << "\n";
+            }
+#endif  // DYLIB_PRINT_MISSING
+            throw load_error(os.str());
+        }
     }
 
     dylib(const std::string &dir_path, const std::string &lib_name, bool decorations = add_filename_decorations)
